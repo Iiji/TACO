@@ -1,5 +1,6 @@
 from metrics.testing_util import run_test
 import json, os
+import time
 import multiprocessing
 import numpy as np
 from typing import Dict
@@ -54,65 +55,100 @@ def get_score(res:list):
     # get number of True in list
     return np.sum([r for r in res if not r<0])
 
+def process_generation(args):
+    task_id, sample, problem_generations, debug, ref_code_fix = args
+    res = []
+    if ref_code_fix:
+        ref_code_results = sample['ref_code_results']
+        ref_score = max(1, int(ref_code_results[len(ref_code_results)*3//4]))
+    # sample_copy = sample.copy()
+    # sample_copy.pop("input_output")
+    # sample_copy['solutions'] = eval(sample_copy['solutions'])[:1]
+    # print(json.dumps(sample_copy, indent=4, ensure_ascii=False))
+    # import pdb; pdb.set_trace()
+    # loop over the generations
+    for o_idx, o in enumerate(problem_generations):
+        # import pdb; pdb.set_trace()
+        curr_res = [-2]
+        try:
+            code = extract_code(o)
+        except Exception as e:
+            if debug:
+                print(f"Failed to extract code from generation {o_idx}, exception = {repr(e)}{e}\n")
+            code = ""
+        try:
+            curr_res = check_correctness(sample, code, timeout=TIMEOUT, debug=debug)
+            if debug:
+                print(f"\nSuccessful compilation of task {o_idx}!")
+            fixed = []
+            for e in curr_res:
+                if isinstance(e, np.ndarray):
+                    e = e.item(0)
+                if isinstance(e, np.bool_):
+                    e = bool(e)
+                fixed.append(e)
+            curr_res = fixed
+            if not np.all(curr_res):
+                if ref_code_fix and get_score(curr_res) >= ref_score:
+                    print(f"Results were not True for all test cases, but the score is higher than the reference code ({get_score(curr_res)} >= {ref_score})")
+                    curr_res = [True]*ref_score
+                else:
+                    print(get_score(curr_res), ref_score)
+                # import pdb; pdb.set_trace()
+                if debug:
+                    print(f"Results were not True for all test cases")
+        except Exception as e:
+            if debug:
+                print(f"Compilation failed, test framework exception = {repr(e)}{e}\n")
+            break
+        finally:
+            assert isinstance(curr_res, list)
+            res.append(curr_res)
+    return task_id, res
+
 def evaluate_generations(generations, samples, idx=None, debug=False, ref_code_fix=True):
     assert len(generations.keys()) == len(samples)
     results = {}
     idx = 0
     for task_id, problem_generations in tqdm(generations.items(), desc=f"Evaluating {len(generations.keys())} problems", position=0, leave=True):
         sample = samples[task_id]
-        res = []
-        if ref_code_fix:
-            ref_code_results = sample['ref_code_results']
-            ref_score = max(1, int(ref_code_results[len(ref_code_results)*3//4]))
-        # sample_copy = sample.copy()
-        # sample_copy.pop("input_output")
-        # sample_copy['solutions'] = eval(sample_copy['solutions'])[:1]
-        # print(json.dumps(sample_copy, indent=4, ensure_ascii=False))
-        # import pdb; pdb.set_trace()
-        # if task_id==126:
-        #     import pdb; pdb.set_trace()
-        # else:
-        #     continue
-        # loop over the generations
-        for o_idx, o in enumerate(problem_generations):
-            # import pdb; pdb.set_trace()
-            curr_res = [-2]
-            try:
-                code = extract_code(o)
-            except Exception as e:
-                if debug:
-                    print(f"Failed to extract code from generation {o_idx}, exception = {repr(e)}{e}\n")
-                code = ""
-            try:
-                curr_res = check_correctness(sample, code, timeout=TIMEOUT, debug=debug)
-                if debug:
-                    print(f"\nSuccessful compilation of task {o_idx}!")
-                fixed = []
-                for e in curr_res:
-                    if isinstance(e, np.ndarray):
-                       e = e.item(0)
-                    if isinstance(e, np.bool_):
-                        e = bool(e)
-                    fixed.append(e)
-                curr_res = fixed
-                if not np.all(curr_res):
-                    if ref_code_fix and get_score(curr_res) >= ref_score:
-                        print(f"Results were not True for all test cases, but the score is higher than the reference code ({get_score(curr_res)} >= {ref_score})")
-                        curr_res = [True]*ref_score
-                    else:
-                        print(get_score(curr_res), ref_score)
-                    # import pdb; pdb.set_trace()
-                    if debug:
-                        print(f"Results were not True for all test cases")
-            except Exception as e:
-                if debug:
-                    print(f"Compilation failed, test framework exception = {repr(e)}{e}\n")
-                break
-            finally:
-                assert isinstance(curr_res, list)
-                res.append(curr_res)
+        args = (task_id, sample, problem_generations, debug, ref_code_fix)
+        _, res = process_generation(args)
+        # print(f"Problem {task_id} evaluation finished, result: {res}")
         results[task_id] = res
         idx += 1
+    return results
+
+def evaluate_generations_parallel(generations, samples, idx=None, debug=False, ref_code_fix=True, nproc = -1):
+    assert len(generations.keys()) == len(samples)
+    import multiprocessing as mp
+    def mp_worker(task, args, semaphore, result_queue, info = None):
+        with semaphore:
+            task_id = args[0]
+            print(f"evaluating {task_id}-th problem")
+            result = task(args)
+            result_queue.put(result)
+            print(f"Problem {task_id} evaluation finished, result: {result}")
+            time.sleep(1)
+
+    if nproc == -1:
+        nproc = mp.cpu_count()
+    semaphore = multiprocessing.Semaphore(nproc)
+    args_list = [(task_id, samples[task_id], problem_generations, debug, ref_code_fix) for i, (task_id, problem_generations) in enumerate(generations.items())]
+    result_queue = multiprocessing.Queue()
+    processes = []
+    for args in args_list:
+        p = multiprocessing.Process(target=mp_worker, args=(process_generation, args, semaphore, result_queue))
+        processes.append(p)
+        p.start()
+
+    for p in processes:
+        p.join()
+    
+    results = {}
+    while not result_queue.empty():
+        task_id, res = result_queue.get()
+        results[task_id]=res
     return results
 
 def evaluate_ref_codes(sample, max_used_sols=-1):
@@ -212,6 +248,7 @@ def main():
     parser.add_argument('--split', type=str, default='test', help='split of the dataset (train, val, test)')
     parser.add_argument('--debug', action='store_true', help='print debug information')
     parser.add_argument('--skip', action='store_true', help='skip')
+    parser.add_argument('--nproc', type=int, default=1, help='num procs for evalutaion')
     args = parser.parse_args()
 
     with open(args.dataset_config, 'r') as f:
@@ -224,7 +261,11 @@ def main():
     if args.skip and os.path.exists(os.path.join(args.result_path, 'taco_metrics.json')):
         metrics = json.load(open(os.path.join(args.result_path, 'taco_metrics.json')))
     else:
-        results = evaluate_generations(generations, taco, debug=args.debug)
+        if args.nproc == 1:
+            results = evaluate_generations(generations, taco, debug=args.debug)
+        else:
+            # You can use evaluate_generations_parallel to parallel executing multiple outputs for each problem
+            results = evaluate_generations_parallel(generations, taco, debug=args.debug, nproc = args.nproc)
         metrics = compute_metrics(results)
     metrics = by_difficulties(metrics, taco)
 
